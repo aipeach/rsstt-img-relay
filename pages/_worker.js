@@ -1,25 +1,21 @@
 /*
  * https://github.com/netnr/workers
  *
- * 2019-10-12 - 2022-05-05
+ * 2019-2022
  * netnr
  *
  * https://github.com/Rongronggg9/rsstt-img-relay
  *
- * 2021-09-13 - 2024-03-20
- * modified by Rongronggg9
+ * 2021-2024
+ * Rongronggg9
  */
-
-addEventListener('fetch', event => {
-    event.passThroughOnException()
-
-    event.respondWith(handleRequest(event))
-})
 
 /**
  * Configurations
  */
 const config = {
+    selfURL: "", // to be filled later
+    URLRegExp: "^(\\w+://.+?)/(.*)$",
     // 从 https://sematext.com/ 申请并修改令牌
     sematextToken: "00000000-0000-0000-0000-000000000000",
     // 是否丢弃请求中的 Referer，在目标网站应用防盗链时有用
@@ -33,6 +29,15 @@ const config = {
     typeList: ["image", "video", "audio", "application", "font", "model"],
     uploadToTelegraphPath: "upload_graph/",
     telegraphURL: "https://telegra.ph",
+    weservURL: "https://wsrv.nl",
+    // see also https://github.com/Rongronggg9/RSS-to-Telegram-Bot/blob/dev/src/web/media.py
+    resizeViaWeservParams: {
+        w: 2560,
+        h: 2560,
+        output: "jpg",
+        q: 89,
+        we: 1
+    },
 };
 
 /**
@@ -44,6 +49,13 @@ function setConfig(env) {
         if (env[k])
             config[k] = typeof config[k] === 'string' ? env[k] : JSON.parse(env[k]);
     });
+}
+
+class TelegraphError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'TelegraphError';
+    }
 }
 
 /**
@@ -59,9 +71,28 @@ async function uploadToTelegraph(blob) {
     })
         .then(res => res.json())
         .then(res => {
-            if (res.error) throw new Error(res.error);
+            if (res.error) throw new TelegraphError(res.error);
             return `${config.telegraphURL}${res[0].src}`;
         });
+}
+
+/**
+ * Fetch resized image via weserv.nl
+ * @param {string} url
+ * @param {object} params
+ * @returns {Promise<Response>}
+ */
+async function fetchResizedImage(url, params = {}) {
+    const searchParams = new URLSearchParams({
+        url,
+        ...config.resizeViaWeservParams,
+        ...params
+    });
+    const resizedURL = `${config.weservURL}/?${searchParams.toString()}`;
+    const response = await fetch(resizedURL);
+    if (response.status >= 300)
+        throw new Error((await response.json())?.message);
+    return response;
 }
 
 /**
@@ -71,8 +102,10 @@ async function uploadToTelegraph(blob) {
  * @param {object} ctx
  */
 async function fetchHandler(request, env, ctx) {
+    ctx.passThroughOnException();
     setConfig(env);
     let doUploadToTelegraph = false;
+    let weservViaSelf = false;
 
     //请求头部、返回对象
     let reqHeaders = new Headers(request.headers),
@@ -83,15 +116,17 @@ async function fetchHandler(request, env, ctx) {
         });
 
     try {
-        //取域名第一个斜杠后的所有信息为代理链接
-        let url = request.url.substr(8);
-        url = decodeURIComponent(url.substr(url.indexOf('/') + 1));
+        const urlMatch = request.url.match(RegExp(config.URLRegExp));
+        config.selfURL = urlMatch[1];
+        let url = urlMatch[2];
 
         // upload to telegra.ph
         if (url.startsWith(config.uploadToTelegraphPath)) {
             doUploadToTelegraph = true;
             url = url.substring(config.uploadToTelegraphPath.length);
         }
+
+        url = decodeURIComponent(url);
 
         //需要忽略的代理
         if (request.method == "OPTIONS" || url.length < 3 || url.indexOf('.') == -1 || url == "favicon.ico" || url == "robots.txt") {
@@ -138,6 +173,7 @@ async function fetchHandler(request, env, ctx) {
                 const urlObj = new URL(url);
                 if (config.weiboCDN.some(x => urlObj.host.endsWith(x))) {
                     fp.headers['referer'] = config.weiboReferer;
+                    weservViaSelf = true;
                 }
             }
 
@@ -167,7 +203,29 @@ async function fetchHandler(request, env, ctx) {
                 outCt = "application/json";
                 outStatus = 415;
             } else if (doUploadToTelegraph) {
-                const redirectToURL = await uploadToTelegraph(await fr.blob());
+                let redirectToURL;
+                const errs = [];
+                const pre = [
+                    async () => fetchResizedImage(`${config.selfURL}/${url}`),
+                ];
+                if (!weservViaSelf)
+                    pre.unshift(async () => fetchResizedImage(url));
+                if ((fr.headers.get("content-length") || 0) <= 5 ** 1024 ** 1024) // 5MiB
+                    pre.unshift(async () => fr);
+                for (const f of pre) {
+                    try {
+                        fr = await f();
+                        redirectToURL = await uploadToTelegraph(await fr.blob());
+                        break;
+                    } catch (err) {
+                        if (err instanceof TelegraphError && err.message.includes('dimensions invalid'))
+                            throw err;
+                        console.log(fr.url, err);
+                        errs.push(err);
+                    }
+                }
+                if (!redirectToURL)
+                    throw new TelegraphError(JSON.stringify(errs.map((err) => err.message)));
                 outCt = 'text/plain';
                 outStatus = 301;
                 outStatusText = 'Moved Permanently';  // mark it permanent to allow caching
@@ -185,18 +243,29 @@ async function fetchHandler(request, env, ctx) {
             }
         }
     } catch (err) {
+        let errMsg;
+        if (err instanceof TelegraphError) {
+            errMsg = err.message;
+            outHeaders.set('X-Telegraph-Error', errMsg);
+            outStatus = 400;
+        } else {
+            errMsg = JSON.stringify(err.stack) || err;
+            outStatus = 500;
+        }
         outCt = "application/json";
         outBody = JSON.stringify({
             code: -1,
-            msg: JSON.stringify(err.stack) || err
+            msg: errMsg
         });
-        outStatus = 500;
     }
 
     //设置类型
     if (outCt && outCt != "") {
         outHeaders.set("content-type", outCt);
     }
+
+    if (outStatus < 400)
+        outHeaders.set("cache-control", "max-age=604800");
 
     let response = new Response(outBody, {
         status: outStatus,
